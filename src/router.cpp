@@ -1,15 +1,14 @@
 #include "../include/router.h"
 #include <iostream>
-#include <mutex>
+#include <shared_mutex>
 #include <random>
 #include <unordered_map>
 #include <spdlog/spdlog.h> // ⭐ 引入日志库
+#include "ConnectionPool.h"
 
 using json = nlohmann::json;
 
-// 全局互斥锁，保护 MySQL 连接（因为 MySQL C API 不是线程安全的）
-std::mutex db_mutex;
-
+std::shared_mutex token_mtx;
 // 全局 Token 缓存：Token 字符串 -> UserId
 std::unordered_map<std::string, int> token_cache;
 
@@ -28,11 +27,7 @@ std::string handle_router(const std::string& method,
                           const std::string& body, 
                           const std::string& token) {
     
-    // ⭐ 记录收到的请求（排除健康检查等高频日志）
-    spdlog::info("收到请求: {} {}", method, path);
 
-    // 加锁，确保同一时刻只有一个工作线程操作 MySQL
-    std::lock_guard<std::mutex> lock(db_mutex);
     json response_json;
 
     // ==========================================
@@ -51,24 +46,26 @@ std::string handle_router(const std::string& method,
                 return response_json.dump();
             }
 
+            auto conn = ConnectionPool::getInstance().getConnection();
+
             // 防 SQL 注入
             char escaped_user[256];
             char escaped_pass[256];
-            mysql_real_escape_string(g_conn, escaped_user, username.c_str(), username.length());
-            mysql_real_escape_string(g_conn, escaped_pass, password.c_str(), password.length());
+            mysql_real_escape_string(conn.get(), escaped_user, username.c_str(), username.length());
+            mysql_real_escape_string(conn.get(), escaped_pass, password.c_str(), password.length());
 
             std::string sql = "SELECT id FROM users WHERE username = '" + 
                               std::string(escaped_user) + "' AND password = '" + 
                               std::string(escaped_pass) + "'"; 
 
-            if (mysql_query(g_conn, sql.c_str()) != 0) {
-                spdlog::error("登录查询数据库失败: {}", mysql_error(g_conn));
+            if (mysql_query(conn.get(), sql.c_str()) != 0) {
+                spdlog::error("登录查询数据库失败: {}", mysql_error(conn.get()));
                 response_json["code"] = 500;
                 response_json["msg"] = "服务器内部错误"; // ⭐ 错误脱敏
             } else {
-                MYSQL_RES* result = mysql_store_result(g_conn);
+                MYSQL_RES* result = mysql_store_result(conn.get());
                 if (result == nullptr) {
-                    spdlog::error("获取结果集失败: {}", mysql_error(g_conn));
+                    spdlog::error("获取结果集失败: {}", mysql_error(conn.get()));
                     response_json["code"] = 500;
                     response_json["msg"] = "服务器内部错误";
                 } else {
@@ -76,9 +73,12 @@ std::string handle_router(const std::string& method,
                     if (row != nullptr) {
                         int user_id = std::stoi(row[0]);
                         
-                        // 生成 Token 并缓存
                         std::string new_token = generate_token();
-                        token_cache[new_token] = user_id;
+                        // 生成 Token 并缓存
+                        {
+                            std::lock_guard<std::shared_mutex> lock(token_mtx);
+                            token_cache[new_token] = user_id;
+                        }
 
                         spdlog::info("用户 [{}] 登录成功，分配 Token: {}", username, new_token);
                         response_json["code"] = 200;
@@ -103,21 +103,23 @@ std::string handle_router(const std::string& method,
     // ==========================================
     // 2. 拦截器：除注册和登录外，必须校验 Token
     // ==========================================
+
+    // ==========================================
+    // 2. 拦截器：除注册和登录外，必须校验 Token
+    // ==========================================
+    int current_user_id = 0;
     if (path != "/api/register" && path != "/api/login") {
-        if (token.empty() || token_cache.find(token) == token_cache.end()) {
+        std::shared_lock<std::shared_mutex> lock(token_mtx);
+        auto it = token_cache.find(token);
+        if (token.empty() || it == token_cache.end()) {
             spdlog::warn("拦截非法请求，Token 无效或缺失。请求路径: {}", path);
             response_json["code"] = 401;
             response_json["msg"] = "未授权，请先登录";
             return response_json.dump();
         }
+        current_user_id = it->second; // ⭐ 一次加锁，搞定两件事
     }
-
-    // 如果能走到这里，说明 Token 有效，获取当前用户 ID
-    int current_user_id = 0;
-    if (token_cache.find(token) != token_cache.end()) {
-        current_user_id = token_cache[token];
-    }
-
+    
     // ==========================================
     // 3. 注册接口
     // ==========================================
@@ -132,17 +134,18 @@ std::string handle_router(const std::string& method,
                 response_json["msg"] = "用户名或密码不能为空";
                 return response_json.dump();
             }
+            auto conn = ConnectionPool::getInstance().getConnection();
 
             char escaped_user[256];
             char escaped_pass[256];
-            mysql_real_escape_string(g_conn, escaped_user, username.c_str(), username.length());
-            mysql_real_escape_string(g_conn, escaped_pass, password.c_str(), password.length());
+            mysql_real_escape_string(conn.get(), escaped_user, username.c_str(), username.length());
+            mysql_real_escape_string(conn.get(), escaped_pass, password.c_str(), password.length());
 
             std::string sql = "INSERT INTO users(username, password) VALUES('" + 
                               std::string(escaped_user) + "', '" + std::string(escaped_pass) + "')";  
 
-            if (mysql_query(g_conn, sql.c_str()) != 0) {
-                spdlog::error("注册插入失败: {}", mysql_error(g_conn));
+            if (mysql_query(conn.get(), sql.c_str()) != 0) {
+                spdlog::error("注册插入失败: {}", mysql_error(conn.get()));
                 response_json["code"] = 500;
                 response_json["msg"] = "注册失败，用户名可能已存在";
             } else {
@@ -171,15 +174,17 @@ std::string handle_router(const std::string& method,
                 return response_json.dump();
             }
 
+            auto conn = ConnectionPool::getInstance().getConnection();
+
             char escaped_title[512];
-            mysql_real_escape_string(g_conn, escaped_title, title.c_str(), title.length());
+            mysql_real_escape_string(conn.get(), escaped_title, title.c_str(), title.length());
 
             // ⭐ 使用动态的 current_user_id 绑定数据
             std::string sql = "INSERT INTO todos(user_id, title) VALUES(" + 
                               std::to_string(current_user_id) + ", '" + std::string(escaped_title) + "')";
 
-            if (mysql_query(g_conn, sql.c_str()) != 0) {
-                spdlog::error("添加待办失败: {}", mysql_error(g_conn));
+            if (mysql_query(conn.get(), sql.c_str()) != 0) {
+                spdlog::error("添加待办失败: {}", mysql_error(conn.get()));
                 response_json["code"] = 500;
                 response_json["msg"] = "服务器内部错误";
             } else {
@@ -197,19 +202,20 @@ std::string handle_router(const std::string& method,
     // 5. 查询待办列表
     // ==========================================
     if (method == "GET" && path == "/api/todos") {
+        auto conn = ConnectionPool::getInstance().getConnection();
         // ⭐ 强加 WHERE user_id 过滤，实现数据隔离
         std::string sql = "SELECT id, title, status, create_time FROM todos WHERE user_id = " + std::to_string(current_user_id);
 
-        if (mysql_query(g_conn, sql.c_str()) != 0) {
-            spdlog::error("查询待办失败: {}", mysql_error(g_conn));
+        if (mysql_query(conn.get(), sql.c_str()) != 0) {
+            spdlog::error("查询待办失败: {}", mysql_error(conn.get()));
             response_json["code"] = 500;
             response_json["msg"] = "服务器内部错误";
             return response_json.dump();
         }
 
-        MYSQL_RES* result = mysql_store_result(g_conn);
+        MYSQL_RES* result = mysql_store_result(conn.get());
         if (result == nullptr) {
-            spdlog::error("获取结果集失败: {}", mysql_error(g_conn));
+            spdlog::error("获取结果集失败: {}", mysql_error(conn.get()));
             response_json["code"] = 500;
             response_json["msg"] = "服务器内部错误";
             return response_json.dump();
@@ -242,17 +248,19 @@ std::string handle_router(const std::string& method,
             std::string id_str = path.substr(s.length());
             int id = std::stoi(id_str);
 
+            auto conn = ConnectionPool::getInstance().getConnection();
+
             // ⭐ 强加 AND user_id，防止水平越权
             std::string sql = "DELETE FROM todos WHERE id = " + std::to_string(id) +
                               " AND user_id = " + std::to_string(current_user_id);
 
-            if (mysql_query(g_conn, sql.c_str()) != 0) {
-                spdlog::error("删除待办失败: {}", mysql_error(g_conn));
+            if (mysql_query(conn.get(), sql.c_str()) != 0) {
+                spdlog::error("删除待办失败: {}", mysql_error(conn.get()));
                 response_json["code"] = 500;
                 response_json["msg"] = "服务器内部错误";
             } else {
                 // 检查是否真的删除了数据
-                if (mysql_affected_rows(g_conn) > 0) {
+                if (mysql_affected_rows(conn.get()) > 0) {
                     response_json["code"] = 200;
                     response_json["msg"] = "删除成功";
                 } else {
@@ -279,17 +287,19 @@ std::string handle_router(const std::string& method,
             json json_body = json::parse(body);
             int status = json_body.value("status", 0);
 
+            auto conn = ConnectionPool::getInstance().getConnection();
+
             // ⭐ 强加 AND user_id，防止水平越权
             std::string sql = "UPDATE todos SET status = " + std::to_string(status) + 
                               " WHERE id = " + std::to_string(id) + 
                               " AND user_id = " + std::to_string(current_user_id);
 
-            if (mysql_query(g_conn, sql.c_str()) != 0) {
-                spdlog::error("更新待办失败: {}", mysql_error(g_conn));
+            if (mysql_query(conn.get(), sql.c_str()) != 0) {
+                spdlog::error("更新待办失败: {}", mysql_error(conn.get()));
                 response_json["code"] = 500;
                 response_json["msg"] = "服务器内部错误";
             } else {
-                if (mysql_affected_rows(g_conn) > 0) {
+                if (mysql_affected_rows(conn.get()) > 0) {
                     response_json["code"] = 200;
                     response_json["msg"] = "更新成功";
                 } else {

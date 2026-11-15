@@ -5,17 +5,17 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <string>
-#include <mysql/mysql.h>
-#include "router.h"
-#include "ThreadPool.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <cstring>
 #include <cerrno>
+#include <mysql/mysql.h>
+#include "router.h"
+#include "ThreadPool.h"
+#include "ConnectionPool.h"
 
 
-MYSQL* g_conn;
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -29,8 +29,9 @@ int main() {
     auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("logs/server.log", 1024 * 1024 * 5, 3);
 
     spdlog::set_default_logger(std::make_shared<spdlog::logger>("multi", spdlog::sinks_init_list{console_sink, file_sink}));
-    spdlog::set_level(spdlog::level::info); //设置日志级别为 info
-    spdlog::flush_on(spdlog::level::info);  //遇到 info 级别立即刷新到磁盘
+    spdlog::set_level(spdlog::level::warn); //设置日志级别为 info
+    //spdlog::flush_on(spdlog::level::info);  //遇到 info 级别立即刷新到磁盘
+    //每次刷新磁盘会导致性能下降
 
     spdlog::info("======== 服务器正在启动 ========");
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -64,19 +65,8 @@ int main() {
     //存储 recv 到的数据
     std::unordered_map<int, std::string> buffers;
 
-    MYSQL* conn = mysql_init(nullptr);
-    if (conn == nullptr) {
-        spdlog::error("MySQL 初始化失败");
-        return 1;
-    }
-
-    g_conn = conn;
-
-    if (!mysql_real_connect(conn, "127.0.0.1", "root", "123456", "todo_db", 3306, nullptr, 0)) {
-        spdlog::error("MySQL 连接失败：{}", mysql_error(conn));
-        return 1;
-    }
-    spdlog::info("MySQL 连接成功");
+    ConnectionPool::getInstance().init("127.0.0.1", "root", "123456", "todo_db", 3306, 10);
+    spdlog::info("MySQL 连接池初始化成功");
 
     ThreadPool pool(4);
     spdlog::info("线程池启动成功，工作线程数: 4");
@@ -199,8 +189,7 @@ int main() {
                                             }
                                         }
                                         
-                                        // 从主线程剥离，取消监听并清空 buffer
-                                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                                        // 从主线程剥离，清空 buffer
                                         buffers[fd].erase();
                                         
                                         // 丢进线程池
@@ -240,6 +229,4 @@ int main() {
             }
         }
     }
-
-    mysql_close(conn);
 }
